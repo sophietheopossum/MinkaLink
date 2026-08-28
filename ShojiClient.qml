@@ -9,6 +9,11 @@ import QtQuick
 // and a raw broadcast signal. App-specific state shapes (window maps,
 // workspace views) belong in each app's services, layered on top of this.
 //
+// The protocol and correlation now live in NdjsonRpc, which this composes:
+// identical logic serves MinkaLedger over a child process's stdio, and one
+// implementation cannot drift from the other. Everything below is the part
+// that is genuinely socket-specific — the path, the connection, reconnecting.
+//
 //   send:  { "method": string, "params"?: unknown }         fire-and-forget
 //          { "id": number, "method": ..., "params": ... }   expects response
 //   recv:  { "event": string, "payload": unknown }          broadcast
@@ -26,7 +31,7 @@ Singleton {
 
     readonly property bool connected: socket.connected
     // True once a response has landed on the current connection.
-    property bool ready: false
+    readonly property bool ready: rpc.ready
 
     // Every {event, payload} broadcast, unfiltered.
     signal broadcast(string name, var payload)
@@ -37,43 +42,26 @@ Singleton {
         return `${runtimeDir}/shojiwm-${display}.sock`;
     }
 
-    property int _nextId: 1
-    property var _pending: ({})
-
     // Request with an id-correlated response; onResult(result, error) is
     // optional.
     function request(method, params, onResult) {
-        const id = _nextId++;
-        if (onResult)
-            _pending[id] = onResult;
-        _write(params === undefined ? { id, method } : { id, method, params });
+        return rpc.request(method, params, onResult);
     }
 
     // Fire-and-forget command.
     function send(method, params) {
-        _write(params === undefined ? { method } : { method, params });
+        rpc.send(method, params);
     }
 
-    function _write(message) {
-        if (!socket.connected)
-            return;
-        socket.write(JSON.stringify(message) + "\n");
-        socket.flush();
-    }
-
-    function _handleMessage(message) {
-        if (message.event !== undefined) {
-            root.broadcast(message.event, message.payload);
-            return;
+    NdjsonRpc {
+        id: rpc
+        writeLine: line => {
+            if (!socket.connected)
+                return;
+            socket.write(line);
+            socket.flush();
         }
-        if (message.id !== undefined) {
-            root.ready = true;
-            const callback = root._pending[message.id];
-            if (callback) {
-                delete root._pending[message.id];
-                callback(message.result, message.error);
-            }
-        }
+        onBroadcast: (name, payload) => root.broadcast(name, payload)
     }
 
     Socket {
@@ -82,27 +70,11 @@ Singleton {
         connected: root.wanted
 
         parser: SplitParser {
-            onRead: line => {
-                const trimmed = line.trim();
-                if (trimmed.length === 0)
-                    return;
-                let message;
-                try {
-                    message = JSON.parse(trimmed);
-                } catch (e) {
-                    return; // ignore malformed lines
-                }
-                root._handleMessage(message);
-            }
+            onRead: line => rpc.feedLine(line)
         }
 
-        onConnectedChanged: {
-            root._pending = {};
-            if (!connected)
-                root.ready = false;
-        }
-
-        onError: root.ready = false
+        onConnectedChanged: rpc.reset()
+        onError: rpc.reset()
     }
 
     onWantedChanged: socket.connected = wanted
