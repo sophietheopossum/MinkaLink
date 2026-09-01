@@ -29,6 +29,21 @@ Singleton {
     // (MinkaMon idles this way: no geometry consumer, no socket traffic).
     property bool wanted: true
 
+    // A peer can stop SERVING a connection without CLOSING it. ShojiWM rebinds
+    // its IPC socket on config hot-reload and drops the old server side without
+    // shutting the fd, so the client keeps a socket the kernel still reports as
+    // ESTABLISHED that will never deliver another byte. There is no error and no
+    // EOF, so `connected` stays true, the reconnect Timer below never arms, and
+    // the client is wedged silently — MinkaShell sat like that for hours on
+    // 1/9/2026 with a dock that could neither click a window nor track focus.
+    // Liveness therefore has to be probed, not inferred from the socket state.
+    property int probeIdleMs: 15000    // this quiet -> send a probe
+    property int probeTimeoutMs: 5000  // probe unanswered this long -> cycle
+    property string probeMethod: "workspaces.get"
+
+    property double _lastRxAt: 0
+    property double _probeSentAt: 0
+
     readonly property bool connected: socket.connected
     // True once a response has landed on the current connection.
     readonly property bool ready: rpc.ready
@@ -70,10 +85,17 @@ Singleton {
         connected: root.wanted
 
         parser: SplitParser {
-            onRead: line => rpc.feedLine(line)
+            onRead: line => {
+                root._lastRxAt = Date.now();
+                rpc.feedLine(line);
+            }
         }
 
-        onConnectedChanged: rpc.reset()
+        onConnectedChanged: {
+            rpc.reset();
+            root._lastRxAt = Date.now();
+            root._probeSentAt = 0;
+        }
         onError: rpc.reset()
     }
 
@@ -84,5 +106,31 @@ Singleton {
         repeat: true
         running: root.wanted && !socket.connected
         onTriggered: socket.connected = true
+    }
+
+    // Liveness probe for the wedged-but-connected case described above. Only
+    // runs while we believe we are connected; the reconnect Timer owns the rest.
+    Timer {
+        interval: 2000
+        repeat: true
+        running: root.wanted && socket.connected
+        onTriggered: {
+            const now = Date.now();
+            if (root._probeSentAt > 0) {
+                if (root._lastRxAt >= root._probeSentAt) {
+                    root._probeSentAt = 0;
+                } else if (now - root._probeSentAt > root.probeTimeoutMs) {
+                    // Nothing came back: drop it and let the reconnect Timer
+                    // above re-establish on the current socket path.
+                    root._probeSentAt = 0;
+                    socket.connected = false;
+                }
+                return;
+            }
+            if (now - root._lastRxAt > root.probeIdleMs) {
+                root._probeSentAt = now;
+                rpc.request(root.probeMethod);
+            }
+        }
     }
 }
