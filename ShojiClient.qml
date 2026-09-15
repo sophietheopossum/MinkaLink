@@ -1,3 +1,4 @@
+pragma ComponentBehavior: Bound
 pragma Singleton
 import Quickshell
 import Quickshell.Io
@@ -44,7 +45,19 @@ Singleton {
     property double _lastRxAt: 0
     property double _probeSentAt: 0
 
-    readonly property bool connected: socket.connected
+    // A FAILED connect wedges a Quickshell 0.3.1 Socket too. When the attempt
+    // errors (ServerNotFoundError, ConnectionRefusedError) the Socket only logs
+    // it: it keeps the dead QLocalSocket, `connected` stays false, and every
+    // later `connected = true` is a no-op because a socket object already
+    // exists (Socket::setConnected only dials when it has none). ShojiWM's
+    // config hot-reload can take more than the reconnect Timer's one second,
+    // so the first retry landed before the new listener and the client never
+    // tried again: on 15/9/2026 MinkaShell, MinkaMon and MinkaShot all lost
+    // ShojiWM for good after a Super+Shift+R. So every attempt dials on a
+    // brand-new Socket, and the one it replaces is destroyed.
+    property var socket: null
+
+    readonly property bool connected: root.socket !== null && root.socket.connected
     // True once a response has landed on the current connection.
     readonly property bool ready: rpc.ready
 
@@ -71,41 +84,70 @@ Singleton {
     NdjsonRpc {
         id: rpc
         writeLine: line => {
-            if (!socket.connected)
+            if (!root.connected)
                 return;
-            socket.write(line);
-            socket.flush();
+            root.socket.write(line);
+            root.socket.flush();
         }
         onBroadcast: (name, payload) => root.broadcast(name, payload)
     }
 
-    Socket {
-        id: socket
-        path: root.socketPath
-        connected: root.wanted
+    Component {
+        id: socketComponent
 
-        parser: SplitParser {
-            onRead: line => {
-                root._lastRxAt = Date.now();
-                rpc.feedLine(line);
+        Socket {
+            parser: SplitParser {
+                onRead: line => {
+                    root._lastRxAt = Date.now();
+                    rpc.feedLine(line);
+                }
             }
-        }
 
-        onConnectedChanged: {
-            rpc.reset();
-            root._lastRxAt = Date.now();
-            root._probeSentAt = 0;
+            onConnectedChanged: {
+                rpc.reset();
+                root._lastRxAt = Date.now();
+                root._probeSentAt = 0;
+            }
+            onError: rpc.reset()
         }
-        onError: rpc.reset()
     }
 
-    onWantedChanged: socket.connected = wanted
+    // Drop the current Socket, if any. A connected one is disconnected first;
+    // either way it is destroyed rather than reused.
+    function dropSocket() {
+        const old = root.socket;
+        if (old === null)
+            return;
+        root.socket = null;
+        rpc.reset();
+        if (old.connected)
+            old.connected = false;
+        old.destroy();
+    }
+
+    // Dial on a fresh Socket.
+    function dial() {
+        root.dropSocket();
+        root.socket = socketComponent.createObject(root, { path: root.socketPath, connected: true });
+    }
+
+    onWantedChanged: {
+        if (root.wanted)
+            root.dial();
+        else
+            root.dropSocket();
+    }
+
+    Component.onCompleted: {
+        if (root.wanted)
+            root.dial();
+    }
 
     Timer {
         interval: 1000
         repeat: true
-        running: root.wanted && !socket.connected
-        onTriggered: socket.connected = true
+        running: root.wanted && !root.connected
+        onTriggered: root.dial()
     }
 
     // Liveness probe for the wedged-but-connected case described above. Only
@@ -113,7 +155,7 @@ Singleton {
     Timer {
         interval: 2000
         repeat: true
-        running: root.wanted && socket.connected
+        running: root.wanted && root.connected
         onTriggered: {
             const now = Date.now();
             if (root._probeSentAt > 0) {
@@ -121,9 +163,9 @@ Singleton {
                     root._probeSentAt = 0;
                 } else if (now - root._probeSentAt > root.probeTimeoutMs) {
                     // Nothing came back: drop it and let the reconnect Timer
-                    // above re-establish on the current socket path.
+                    // above dial again on the current socket path.
                     root._probeSentAt = 0;
-                    socket.connected = false;
+                    root.dropSocket();
                 }
                 return;
             }
