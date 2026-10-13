@@ -49,12 +49,13 @@ Singleton {
     // errors (ServerNotFoundError, ConnectionRefusedError) the Socket only logs
     // it: it keeps the dead QLocalSocket, `connected` stays false, and every
     // later `connected = true` is a no-op because a socket object already
-    // exists (Socket::setConnected only dials when it has none). ShojiWM's
-    // config hot-reload can take more than the reconnect Timer's one second,
-    // so the first retry landed before the new listener and the client never
-    // tried again: on 15/9/2026 MinkaShell, MinkaMon and MinkaShot all lost
-    // ShojiWM for good after a Super+Shift+R. So every attempt dials on a
-    // brand-new Socket, and the one it replaces is destroyed.
+    // exists (Socket::setConnected only dials when it has none). The
+    // TypeScript config's hot-reload can take more than the reconnect Timer's
+    // one second, so the first retry landed before the new listener and the
+    // client never tried again: on 15/9/2026 MinkaShell, MinkaMon and
+    // MinkaShot all lost ShojiWM for good after a Super+Shift+R (the Rust
+    // config, live since 6/10/2026, has no reload key). So every attempt dials
+    // on a brand-new Socket, and the one it replaces is destroyed.
     property var socket: null
 
     readonly property bool connected: root.socket !== null && root.socket.connected
