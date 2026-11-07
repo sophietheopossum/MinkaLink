@@ -1,2 +1,3 @@
 singleton ShojiClient 1.0 ShojiClient.qml
 NdjsonRpc 1.0 NdjsonRpc.qml
+CoreProcess 1.0 CoreProcess.qml
